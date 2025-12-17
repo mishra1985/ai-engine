@@ -7,7 +7,6 @@ import requests
 import os
 from datetime import datetime, timedelta, timezone
 from collections import Counter
-from functools import lru_cache
 from typing import Optional, Dict, Any, List, Tuple
 
 # --- API IMPORTS ---
@@ -16,18 +15,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from supabase import create_client, Client
-# 🔴 CHANGED: Removed Ollama, Added Groq
-from langchain_groq import ChatGroq 
+from langchain_groq import ChatGroq
 from sentence_transformers import SentenceTransformer
-import config
 
-# --- CONFIGURATION ---
-SYSTEM_NAME = "Suraksha Sentinel v102 (Groq Cloud)"
-# We force a Groq-supported model (Llama3 is best on Groq)
-GROQ_MODEL = "llama3-70b-8192" 
+# --- CONFIGURATION (ENV VARS ONLY) ---
+SYSTEM_NAME = "Suraksha Sentinel v104 (Render Stable)"
+# Allow overriding model via Env Var, default to Llama3
+MODEL_NAME = os.environ.get("LLM_MODEL", "llama3-70b-8192") 
 SAFE_LIMIT = 20 
-GEO_API_KEY = getattr(config, "GEO_API_KEY", None)
-GROQ_API_KEY = getattr(config, "GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
 
 # =========================================================================
 # 📚 DEFINITIONS
@@ -45,30 +40,32 @@ class SentinelEngine:
     def __init__(self):
         print(f">> ⚙️ Initializing {SYSTEM_NAME}...")
         
-        # 1. Database Connections
-        self.db_live: Client = create_client(config.URL_A, config.KEY_A)
-        self.db_brain: Client = create_client(config.URL_B, config.KEY_B)
-        
-        # 2. Initialize Groq LLM (Cloud) instead of Ollama (Local)
-        if not GROQ_API_KEY:
-            print(">> ⚠️ CRITICAL: GROQ_API_KEY not found in config or env!")
-        
-        # Logic Brain: Temperature 0 for strict JSON/Rules
+        # 1. Secure Database Connections (From Env Vars)
+        try:
+            self.db_live: Client = create_client(os.environ["URL_A"], os.environ["KEY_A"])
+            self.db_brain: Client = create_client(os.environ["URL_B"], os.environ["KEY_B"])
+        except KeyError as e:
+            raise RuntimeError(f"CRITICAL: Missing Env Var {e}. Check Render Dashboard.")
+
+        # 2. Initialize Groq (Cloud LLM)
+        groq_key = os.environ.get("GROQ_API_KEY")
+        if not groq_key:
+            print(">> ⚠️ WARNING: GROQ_API_KEY missing. LLM features will fail.")
+
         self.llm_logic = ChatGroq(
-            model=GROQ_MODEL,
+            model_name=MODEL_NAME,  
             temperature=0.0,
-            api_key=GROQ_API_KEY
+            groq_api_key=groq_key   
         )
         
-        # Chat Brain: Temperature 0.3 for natural conversation
         self.llm_chat = ChatGroq(
-            model=GROQ_MODEL,
+            model_name=MODEL_NAME,
             temperature=0.3,
-            api_key=GROQ_API_KEY
+            groq_api_key=groq_key
         )
 
-        # 3. Embeddings (Local CPU) - This works fine on Render standard instances
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2') 
+        # 3. Lazy Embedder (Init is None to save startup RAM)
+        self.embedder = None
         
         # 4. Simulate Sleep (Database cleanup)
         try:
@@ -82,13 +79,18 @@ class SentinelEngine:
         }
         print(f">> ✅ System Online (Powered by Groq).")
 
+    # --- LAZY LOADER FOR EMBEDDINGS (CPU Mode for Free Tier) ---
+    def _get_embedder(self):
+        if self.embedder is None:
+            print(">> 🧠 Loading Embedding Model (Lazy Init)...")
+            # Force CPU to prevent CUDA errors on Render Free Tier
+            self.embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+        return self.embedder
+
     # --- HELPER: Safe Invocation for Groq ---
-    # Groq returns an object (AIMessage), Ollama returned a string.
-    # This wrapper extracts the string content safely.
     def _ask_llm(self, llm, prompt: str) -> str:
         try:
             response = llm.invoke(prompt)
-            # If response is an object with .content, extract it. If string, return it.
             return response.content if hasattr(response, 'content') else str(response)
         except Exception as e:
             print(f">> ⚠️ LLM Error: {e}")
@@ -116,7 +118,6 @@ class SentinelEngine:
             Output ONE short, imperative rule starting with "When...".
             Do not include explanations.
             """
-            # Changed to use helper
             rule = self._ask_llm(self.llm_logic, prompt).strip()
             
             if len(rule) < 15 or not rule.lower().startswith("when"): return
@@ -126,7 +127,9 @@ class SentinelEngine:
                 self._update_rule_health([existing[0]['id']], "success")
                 return
 
-            vec = self.embedder.encode(rule).tolist()
+            # Use Lazy Embedder
+            vec = self._get_embedder().encode(rule).tolist()
+            
             self.db_brain.table("learnings").insert({
                 "topic": "reasoning_rule",
                 "insight": rule,
@@ -137,7 +140,9 @@ class SentinelEngine:
 
     def _recall_rules(self, text: str) -> Tuple[str, List[int]]:
         try:
-            vec = self.embedder.encode(text).tolist()
+            # Use Lazy Embedder
+            vec = self._get_embedder().encode(text).tolist()
+            
             res = self.db_brain.rpc('match_learnings_robust', {
                 'query_embedding': vec, 'match_threshold': 0.60, 'match_count': 3
             }).execute()
@@ -280,7 +285,7 @@ class SentinelEngine:
         except: pass
 
     # =========================================================================
-    # 🧠 BRAIN 1 & 2: PERCEPTION
+    # 🧠 BRAIN 1 & 2: PERCEPTION & REASONING
     # =========================================================================
     def _perceive_intent(self, text: str) -> Dict[str, Any]:
         text_lower = text.lower()
@@ -308,7 +313,6 @@ class SentinelEngine:
         Format: JSON {{ "intent": "...", "confidence": 0.9 }}
         """
         try:
-            # Changed to use helper
             raw = self._ask_llm(self.llm_logic, prompt).strip()
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if match: return json.loads(match.group(0))
@@ -324,22 +328,25 @@ class SentinelEngine:
 
         learned_rules_text, active_rule_ids = self._recall_rules(user_text)
         
+        # --- INITIALIZE VARIABLES (Prevents NameError crashes) ---
         response_text = ""
         ui_widget = None
         widget_data = None
         action_log = "general_chat"
-        success_signal = "failure" 
-
-        # --- 1. ANALYTICS ---
+        success_signal = "neutral" 
+        
+        # --- 1. ADMIN KILL SWITCH ---
         if intent == "admin_kill_switch":
             if "auth=delta_force_99" in user_text.lower():
                 self.session_state["learning_disabled"] = True
                 response_text = "🔒 **SECURITY:** Learning DISABLED."
             else:
                 response_text = "❌ **ACCESS DENIED**"
+            
             self._log_interaction(user_text, intent, response_text)
             return {"response": response_text, "ui_widget": None, "widget_data": None}
 
+        # --- 2. ANALYTICS ---
         if intent == "zone_risk_analysis":
             report, chart_data = self.calculate_zone_risk()
             
@@ -390,7 +397,6 @@ class SentinelEngine:
                 
                 response_text = f"🛡️ **System Status:**\n- Active SOS: {m['active_sos']}\n- Group Users: {m['group_users']}\n- Danger Zones: {m['danger_zones']}"
                 
-                # FULL DASHBOARD WIDGET
                 self._log_interaction(user_text, intent, response_text)
                 return {
                     "response": response_text,
@@ -405,7 +411,7 @@ class SentinelEngine:
             self._log_interaction(user_text, intent, response_text)
             return {"response": response_text, "ui_widget": None, "widget_data": None}
 
-        # --- 2. COMPLEX LOGIC ---
+        # --- 3. COMPLEX LOGIC ---
         try:
             if intent == "user_analytics":
                 user_match = re.search(r"(user|details)\s+([A-Za-z0-9\-]+)", user_text, re.IGNORECASE)
@@ -417,7 +423,6 @@ class SentinelEngine:
                         data = self.get_user_360(tid)
                         if data["exists"]:
                             summary_prompt = f"GOVERNANCE: {learned_rules_text}\nDATA: {data['stats']}\nWrite profile."
-                            # Changed to use helper
                             response_text = self._ask_llm(self.llm_chat, summary_prompt)
                             ui_widget = "dashboard_stats"
                             widget_data = {"pie_chart": {"Safe": data['stats']['safe'], "Danger": data['stats']['danger']}, "heatmap": data['heatmap']}
@@ -436,20 +441,19 @@ class SentinelEngine:
                 USER: {user_text}
                 Answer strictly about safety. If asked about SOS, it means Emergency.
                 """
-                # Changed to use helper
                 response_text = self._ask_llm(self.llm_chat, chat_prompt)
-                success_signal = "neutral"
+                # Success signal remains 'neutral' for chat unless governed by a rule
 
         except Exception as e:
             response_text = f"Error: {str(e)}"
             action_log = "error"
             success_signal = "failure"
 
-        # --- 3. MAINTENANCE ---
+        # --- 4. LOG & LEARN ---
         self._log_interaction(user_text, intent, response_text)
 
         if active_rule_ids and success_signal != "neutral":
-            self._update_rule_health(active_rule_ids, success_signal)
+            self._update_rule_health(active_rule_ids, "success")
 
         if self._should_learn(intent, confidence, action_log):
             self.learn_reasoning_rule(user_text, intent, action_log)
@@ -497,15 +501,27 @@ class SentinelEngine:
         except: return 0
 
 # =========================================================================
-# 🔌 API
+# 🔌 API (LAZY ENGINE INIT)
 # =========================================================================
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-engine = SentinelEngine()
+
+# Lazy Loading Engine
+_engine = None
+def get_engine():
+    global _engine
+    if _engine is None:
+        _engine = SentinelEngine()
+    return _engine
+
+@app.get("/")
+def health():
+    return {"status": "Suraksha Sentinel running", "timestamp": time.time()}
 
 class Query(BaseModel): text: str
 
 @app.post("/chat")
 def chat_endpoint(q: Query):
+    engine = get_engine()
     res = engine.process_query(q.text)
     return {"response": res.get("response", ""), "ui_widget": res.get("ui_widget"), "widget_data": res.get("widget_data")}
